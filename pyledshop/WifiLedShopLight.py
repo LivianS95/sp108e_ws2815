@@ -168,20 +168,22 @@ class WifiLedShopLight(LightEntity):
             # Check current state (use desired state if available, otherwise sync)
             if self._desired_state is None:
                 await self._sync_state()
-            was_off = not (self._desired_state if self._desired_state is not None else self._state.is_on)
+            was_off = not (
+                self._desired_state if self._desired_state is not None else self._state.is_on
+            )
             
             # Set desired state as source of truth
             self._desired_state = True
+
+            # Track if a color was explicitly requested
+            explicit_effect = kwargs.get(ATTR_EFFECT)
+            has_rgb = "rgb_color" in kwargs or ATTR_HS_COLOR in kwargs
             
             # Turn on first if it was off (needed for colors/effects to work)
             if was_off:
                 await self._hass.async_add_executor_job(self._toggle_sync, True)
                 self.async_write_ha_state()
-                # Apply defaults after turning on
-                if ATTR_EFFECT not in kwargs:
-                    await self._hass.async_add_executor_job(
-                        self.set_effect, self._default_effect
-                    )
+                # Apply default speed after turning on (unless overridden)
                 if "speed" not in kwargs:
                     await self._hass.async_add_executor_job(
                         self.set_speed, self._default_speed
@@ -227,8 +229,33 @@ class WifiLedShopLight(LightEntity):
             use_brightness_debounce = (
                 brightness_value is not None and len(other_params) == 0 and not was_off
             )
+
+            # Decide which effect to apply:
+            # - If an explicit effect was provided, use it
+            # - Else, if an RGB/HS color was provided, force Solid (custom color)
+            # - Else, if we just turned the light on, use the configured default effect
+            should_force_solid = has_rgb and explicit_effect is None
+            effect_to_apply = None
+            if explicit_effect is not None:
+                effect_to_apply = explicit_effect
+            elif should_force_solid:
+                effect_to_apply = "Solid (custom color)"
+            elif was_off:
+                effect_to_apply = self._default_effect
+
+            if effect_to_apply is not None:
+                effect_brightness = (
+                    brightness_value if (brightness_value is not None and not use_brightness_debounce) else None
+                )
+                await self._hass.async_add_executor_job(
+                    self.set_effect, effect_to_apply, effect_brightness
+                )
+                self.async_write_ha_state()
+                # Effect has been handled, don't process it again below
+                if ATTR_EFFECT in other_params:
+                    other_params.pop(ATTR_EFFECT)
             
-            # Process non-brightness parameters immediately (like effects)
+            # Process non-brightness parameters immediately (like color, white, speed)
             for k, v in other_params.items():
                 if k == "rgb_color":
                     await self._hass.async_add_executor_job(self.set_color, *v)
@@ -239,14 +266,6 @@ class WifiLedShopLight(LightEntity):
                     self.async_write_ha_state()
                 elif k == ATTR_WHITE:
                     await self._hass.async_add_executor_job(self.set_white, v)
-                    self.async_write_ha_state()
-                elif k == ATTR_EFFECT:
-                    # If brightness is also provided (and not debounced), set it with the effect
-                    effect_brightness = brightness_value if (brightness_value is not None and not use_brightness_debounce) else None
-                    if effect_brightness is not None:
-                        await self._hass.async_add_executor_job(self.set_effect, v, effect_brightness)
-                    else:
-                        await self._hass.async_add_executor_job(self.set_effect, v, None)
                     self.async_write_ha_state()
                 elif k == "speed":
                     await self._hass.async_add_executor_job(self.set_speed, v)
