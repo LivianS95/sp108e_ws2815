@@ -40,10 +40,6 @@ class WifiLedShopLight(LightEntity):
         self._update_lock = asyncio.Lock()
         self._brightness_task = None  # For debouncing brightness changes
         self._command_lock = asyncio.Lock()  # Prevent concurrent commands
-        self._desired_brightness = None  # Source of truth for brightness
-        self._desired_state = None  # Source of truth for on/off state
-        self._desired_color = None  # Source of truth for color
-        self._desired_effect = None  # Source of truth for effect
 
         self._attr_name = name
         self._attr_supported_color_modes = {ColorMode.RGB}
@@ -79,16 +75,12 @@ class WifiLedShopLight(LightEntity):
 
         # Now apply the color
         self.send_command(Command.SET_COLOR, [r, g, b])
-        # Set as source of truth - this is what we want
-        self._desired_color = (r, g, b)
         # Update state optimistically for immediate feedback
         self._state.color = (r, g, b)
 
     def set_brightness(self, brightness=0):
         brightness = clamp(brightness)
         self.send_command(Command.SET_BRIGHTNESS, [brightness])
-        # Set as source of truth - this is what we want
-        self._desired_brightness = brightness
         # Update state optimistically for immediate feedback
         self._state.brightness = brightness
 
@@ -111,8 +103,6 @@ class WifiLedShopLight(LightEntity):
         # Don't clamp preset values - they can be 0-212
         # MonoEffect values are 205-212, PRESET_EFFECTS are 0-195
         self.send_command(Command.SET_PRESET, [preset])
-        # Set as source of truth - this is what we want
-        self._desired_effect = effect
         # Update state optimistically for immediate feedback
         self._state.mode = preset
         # If brightness is provided with effect, set it too
@@ -153,14 +143,11 @@ class WifiLedShopLight(LightEntity):
             # Just toggle once
             self.send_command(Command.TOGGLE, [])
         
-        # Update desired state as source of truth
+        # Update internal state based on result
         if desired_state is not None:
-            self._desired_state = desired_state
             self._state.is_on = desired_state
         else:
-            # Toggle desired state
-            self._desired_state = not self._state.is_on if self._desired_state is None else not self._desired_state
-            self._state.is_on = self._desired_state
+            self._state.is_on = not self._state.is_on
 
     async def _sync_state(self):
         """Force sync state from device."""
@@ -172,15 +159,9 @@ class WifiLedShopLight(LightEntity):
             return
         
         async with self._command_lock:
-            # Check current state (use desired state if available, otherwise sync)
-            if self._desired_state is None:
-                await self._sync_state()
-            was_off = not (
-                self._desired_state if self._desired_state is not None else self._state.is_on
-            )
-            
-            # Set desired state as source of truth
-            self._desired_state = True
+            # Sync current state from device
+            await self._sync_state()
+            was_off = not self._state.is_on
             
             # Turn on first if it was off (needed for colors/effects to work)
             if was_off:
@@ -317,20 +298,15 @@ class WifiLedShopLight(LightEntity):
             return
         
         async with self._command_lock:
-            # Check current state (use desired state if available, otherwise sync)
-            if self._desired_state is None:
-                await self._sync_state()
-            is_on = self._desired_state if self._desired_state is not None else self._state.is_on
-            
-            # Set desired state as source of truth
-            self._desired_state = False
-            
+            # Sync current state from device
+            await self._sync_state()
+
             # Turn off if it's on - use toggle with desired state
-            if is_on:
+            if self._state.is_on:
                 await self._hass.async_add_executor_job(self._toggle_sync, False)
                 self.async_write_ha_state()
             else:
-                # Already off, but update state to reflect desired state
+                # Already off
                 self._state.is_on = False
                 self.async_write_ha_state()
 
@@ -419,22 +395,6 @@ class WifiLedShopLight(LightEntity):
                 if response:
                     # Update state from device
                     self._state.update_from_sync(bytearray(response))
-                    
-                    # Use desired values as source of truth (don't let sync override)
-                    if self._desired_state is not None:
-                        self._state.is_on = self._desired_state
-                    
-                    if self._desired_brightness is not None:
-                        self._state.brightness = self._desired_brightness
-                    
-                    if self._desired_color is not None:
-                        self._state.color = self._desired_color
-                    
-                    if self._desired_effect is not None:
-                        # Update mode from desired effect
-                        both = {**MONO_EFFECTS, **PRESET_EFFECTS}
-                        if self._desired_effect in both:
-                            self._state.mode = both[self._desired_effect]
             except Exception as e:
                 _LOGGER.warning("Failed to update state: %s", e)
 
