@@ -175,11 +175,7 @@ class WifiLedShopLight(LightEntity):
             
             # Process all provided parameters
             # Handle brightness separately (including *_pct and *_step variants)
-            current_brightness = (
-                self._desired_brightness
-                if self._desired_brightness is not None
-                else self._state.brightness
-            )
+            current_brightness = self._state.brightness
 
             brightness_value = None
             if ATTR_BRIGHTNESS in kwargs and kwargs[ATTR_BRIGHTNESS] is not None:
