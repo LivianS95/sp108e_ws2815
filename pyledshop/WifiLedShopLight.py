@@ -71,6 +71,13 @@ class WifiLedShopLight(LightEntity):
 
     def set_color(self, r=0, g=0, b=0):
         r, g, b = clamp(r), clamp(g), clamp(b)
+        # If we're not already in solid custom-color mode, switch to it
+        solid_mode = MONO_EFFECTS["Solid (custom color)"]
+        if self._state.mode != solid_mode:
+            self.send_command(Command.SET_PRESET, [solid_mode])
+            self._state.mode = solid_mode
+
+        # Now apply the color
         self.send_command(Command.SET_COLOR, [r, g, b])
         # Set as source of truth - this is what we want
         self._desired_color = (r, g, b)
@@ -174,10 +181,6 @@ class WifiLedShopLight(LightEntity):
             
             # Set desired state as source of truth
             self._desired_state = True
-
-            # Track if a color was explicitly requested
-            explicit_effect = kwargs.get(ATTR_EFFECT)
-            has_rgb = "rgb_color" in kwargs or ATTR_HS_COLOR in kwargs
             
             # Turn on first if it was off (needed for colors/effects to work)
             if was_off:
@@ -230,22 +233,21 @@ class WifiLedShopLight(LightEntity):
                 brightness_value is not None and len(other_params) == 0 and not was_off
             )
 
-            # Decide which effect to apply:
-            # - If an explicit effect was provided, use it
-            # - Else, if an RGB/HS color was provided, force Solid (custom color)
-            # - Else, if we just turned the light on, use the configured default effect
-            should_force_solid = has_rgb and explicit_effect is None
+            # Apply effect if explicitly requested, or apply default effect
+            # when turning on from off and no color/effect was provided.
+            explicit_effect = other_params.get(ATTR_EFFECT)
             effect_to_apply = None
             if explicit_effect is not None:
                 effect_to_apply = explicit_effect
-            elif should_force_solid:
-                effect_to_apply = "Solid (custom color)"
-            elif was_off:
+            elif was_off and "rgb_color" not in other_params and ATTR_HS_COLOR not in other_params:
+                # No explicit effect or color; use configured default
                 effect_to_apply = self._default_effect
 
             if effect_to_apply is not None:
                 effect_brightness = (
-                    brightness_value if (brightness_value is not None and not use_brightness_debounce) else None
+                    brightness_value
+                    if (brightness_value is not None and not use_brightness_debounce)
+                    else None
                 )
                 await self._hass.async_add_executor_job(
                     self.set_effect, effect_to_apply, effect_brightness
@@ -254,7 +256,7 @@ class WifiLedShopLight(LightEntity):
                 # Effect has been handled, don't process it again below
                 if ATTR_EFFECT in other_params:
                     other_params.pop(ATTR_EFFECT)
-            
+
             # Process non-brightness parameters immediately (like color, white, speed)
             for k, v in other_params.items():
                 if k == "rgb_color":
