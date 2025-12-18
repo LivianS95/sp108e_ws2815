@@ -36,10 +36,6 @@ class WifiLedShopLight(LightEntity):
         self._retries = retries
         self._state = WifiLedShopLightState()
         self._sock = None
-        self._hass = None  # Will be set by async_added_to_hass
-        self._update_lock = asyncio.Lock()
-        self._brightness_task = None  # For debouncing brightness changes
-        self._command_lock = asyncio.Lock()  # Prevent concurrent commands
 
         self._attr_name = name
         self._attr_supported_color_modes = {ColorMode.RGB}
@@ -57,254 +53,113 @@ class WifiLedShopLight(LightEntity):
             # If we can't get the ID, use a fallback based on IP and port
             self._attr_unique_id = f"sp108e_{ip}_{port}"
 
-        # Don't update during init - let async_added_to_hass handle it
+        # Try an initial state sync; failures are non-fatal
+        try:
+            self.update()
+        except Exception:
+            _LOGGER.debug("Initial update failed", exc_info=True)
 
     def __enter__(self):
         return self
 
     def __exit__(self, type, value, traceback):
-        self._sock.close()
+        if self._sock:
+            self._sock.close()
+
+    # Basic setters ---------------------------------------------------------
 
     def set_color(self, r=0, g=0, b=0):
+        """Set solid RGB color."""
         r, g, b = clamp(r), clamp(g), clamp(b)
-        # If we're not already in solid custom-color mode, switch to it
-        solid_mode = MONO_EFFECTS["Solid (custom color)"]
-        if self._state.mode != solid_mode:
-            self.send_command(Command.SET_PRESET, [solid_mode])
-            self._state.mode = solid_mode
-
-        # Now apply the color
-        self.send_command(Command.SET_COLOR, [r, g, b])
-        # Update state optimistically for immediate feedback
         self._state.color = (r, g, b)
+        self.send_command(Command.SET_COLOR, [r, g, b])
 
     def set_brightness(self, brightness=0):
         brightness = clamp(brightness)
-        self.send_command(Command.SET_BRIGHTNESS, [brightness])
-        # Update state optimistically for immediate feedback
         self._state.brightness = brightness
+        self.send_command(Command.SET_BRIGHTNESS, [brightness])
 
     def set_white(self, white=0):
         white = clamp(white)
+        self._state.white = white
         self.send_command(Command.SET_WHITE, [white])
-        # Don't update state optimistically - let sync handle it
 
     def set_speed(self, speed=0):
         speed = clamp(speed)
+        self._state.speed = speed
         self.send_command(Command.SET_SPEED, [speed])
-        # Don't update state optimistically - let sync handle it
 
-    def set_effect(self, effect, brightness=None):
+    def set_effect(self, effect):
         both = {**MONO_EFFECTS, **PRESET_EFFECTS}
         if effect not in both:
             _LOGGER.warning("Unknown effect: %s", effect)
             return
-        preset = both[effect]
-        # Don't clamp preset values - they can be 0-212
-        # MonoEffect values are 205-212, PRESET_EFFECTS are 0-195
-        self.send_command(Command.SET_PRESET, [preset])
-        # Update state optimistically for immediate feedback
+        preset = clamp(both[effect])
         self._state.mode = preset
-        # If brightness is provided with effect, set it too
-        if brightness is not None:
-            self.set_brightness(brightness)
+        self.send_command(Command.SET_PRESET, [preset])
 
     def set_custom(self, custom):
         custom = clamp(custom, 1, 12)
         self._state.mode = custom
         self.send_command(Command.SET_CUSTOM, [custom])
 
-    def _toggle_sync(self, desired_state=None):
-        """Toggle the light state (synchronous).
-        
-        Args:
-            desired_state: If provided, toggle until this state is reached.
-                          None means just toggle once.
-        """
-        if desired_state is not None:
-            # Toggle until we reach desired state
-            max_attempts = 3
-            for attempt in range(max_attempts):
-                self.send_command(Command.TOGGLE, [])
-                # Small delay to let device process
-                sleep(0.1)
-                # Check if we need to toggle again
-                if attempt < max_attempts - 1:
-                    # Sync to check actual state
-                    try:
-                        response = self.send_command(Command.SYNC, [])
-                        if response:
-                            actual_state = bytearray(response)[1]  # IS_ON position
-                            if bool(actual_state) == desired_state:
-                                break
-                    except:
-                        pass
-        else:
-            # Just toggle once
-            self.send_command(Command.TOGGLE, [])
-        
-        # Update internal state based on result
-        if desired_state is not None:
-            self._state.is_on = desired_state
-        else:
-            self._state.is_on = not self._state.is_on
+    # On/off ---------------------------------------------------------------
 
-    async def _sync_state(self):
-        """Force sync state from device."""
-        await self.async_update()
+    def toggle(self):
+        """Toggle the light and resync state."""
+        initial_state = self._state.is_on
+        self.send_command(Command.TOGGLE, [])
+        # Give the controller a moment to apply the change, then sync
+        sleep(0.1)
+        try:
+            self.update()
+        except Exception:
+            _LOGGER.debug("Toggle update failed", exc_info=True)
+        # If state didn't change, try one more time
+        if self._state.is_on == initial_state:
+            sleep(0.2)
+            try:
+                self.update()
+            except Exception:
+                _LOGGER.debug("Second toggle update failed", exc_info=True)
 
-    async def async_turn_on(self, **kwargs):
-        """Turn on the light with optional parameters (async)."""
-        if self._hass is None:
-            return
-        
-        async with self._command_lock:
-            # Sync current state from device
-            await self._sync_state()
-            was_off = not self._state.is_on
-            
-            # Turn on first if it was off (needed for colors/effects to work)
-            if was_off:
-                await self._hass.async_add_executor_job(self._toggle_sync, True)
-                self.async_write_ha_state()
-                # Apply default speed after turning on (unless overridden)
-                if "speed" not in kwargs:
-                    await self._hass.async_add_executor_job(
-                        self.set_speed, self._default_speed
-                    )
-            
-            # Process all provided parameters
-            # Handle brightness separately (including *_pct and *_step variants)
-            current_brightness = self._state.brightness
+    def turn_on(self, **kwargs):
+        """Turn on the light synchronously."""
+        # Apply defaults if not overridden
+        effect = kwargs.get(ATTR_EFFECT, self._default_effect)
+        speed = kwargs.get("speed", self._default_speed)
 
-            brightness_value = None
-            if ATTR_BRIGHTNESS in kwargs and kwargs[ATTR_BRIGHTNESS] is not None:
-                brightness_value = kwargs[ATTR_BRIGHTNESS]
-            elif ATTR_BRIGHTNESS_PCT in kwargs and kwargs[ATTR_BRIGHTNESS_PCT] is not None:
-                brightness_value = int(255 * kwargs[ATTR_BRIGHTNESS_PCT] / 100)
-            elif ATTR_BRIGHTNESS_STEP in kwargs and kwargs[ATTR_BRIGHTNESS_STEP] is not None:
-                brightness_value = clamp(current_brightness + kwargs[ATTR_BRIGHTNESS_STEP])
-            elif (
-                ATTR_BRIGHTNESS_STEP_PCT in kwargs
-                and kwargs[ATTR_BRIGHTNESS_STEP_PCT] is not None
-            ):
-                delta = int(255 * kwargs[ATTR_BRIGHTNESS_STEP_PCT] / 100)
-                brightness_value = clamp(current_brightness + delta)
+        # Ensure effect/speed are applied first
+        self.set_effect(effect)
+        self.set_speed(speed)
 
-            # Remove all brightness-related keys from other params
-            other_params = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                not in (
-                    ATTR_BRIGHTNESS,
-                    ATTR_BRIGHTNESS_PCT,
-                    ATTR_BRIGHTNESS_STEP,
-                    ATTR_BRIGHTNESS_STEP_PCT,
-                )
-            }
-            
-            # If brightness is the only parameter, use debouncing (slider dragging)
-            # Otherwise apply immediately (click or combined with other params)
-            use_brightness_debounce = (
-                brightness_value is not None and len(other_params) == 0 and not was_off
-            )
-
-            # Apply effect if explicitly requested, or apply default effect
-            # when turning on from off and no color/effect was provided.
-            explicit_effect = other_params.get(ATTR_EFFECT)
-            effect_to_apply = None
-            if explicit_effect is not None:
-                effect_to_apply = explicit_effect
-            elif was_off and "rgb_color" not in other_params and ATTR_HS_COLOR not in other_params:
-                # No explicit effect or color; use configured default
-                effect_to_apply = self._default_effect
-
-            if effect_to_apply is not None:
-                effect_brightness = (
-                    brightness_value
-                    if (brightness_value is not None and not use_brightness_debounce)
-                    else None
-                )
-                await self._hass.async_add_executor_job(
-                    self.set_effect, effect_to_apply, effect_brightness
-                )
-                self.async_write_ha_state()
-                # Effect has been handled, don't process it again below
-                if ATTR_EFFECT in other_params:
-                    other_params.pop(ATTR_EFFECT)
-
-            # Process non-brightness parameters immediately (like color, white, speed)
-            for k, v in other_params.items():
-                if k == "rgb_color":
-                    await self._hass.async_add_executor_job(self.set_color, *v)
-                    self.async_write_ha_state()
-                elif k == ATTR_HS_COLOR:
-                    r, g, b = color_util.color_hs_to_RGB(*v)
-                    await self._hass.async_add_executor_job(self.set_color, r, g, b)
-                    self.async_write_ha_state()
-                elif k == ATTR_WHITE:
-                    await self._hass.async_add_executor_job(self.set_white, v)
-                    self.async_write_ha_state()
-                elif k == "speed":
-                    await self._hass.async_add_executor_job(self.set_speed, v)
-                    self.async_write_ha_state()
-                else:
-                    _LOGGER.debug("Unknown control key: %s", k)
-            
-            # Handle brightness
-            if brightness_value is not None:
-                if use_brightness_debounce:
-                    # Cancel any pending brightness operation
-                    if self._brightness_task and not self._brightness_task.done():
-                        self._brightness_task.cancel()
-                        try:
-                            await self._brightness_task
-                        except asyncio.CancelledError:
-                            pass
-                    
-                    # Optimistic update for immediate UI feedback
-                    self._state.brightness = brightness_value
-                    self.async_write_ha_state()
-                    
-                    # Debounce brightness changes (for slider dragging)
-                    async def set_brightness_debounced():
-                        try:
-                            await asyncio.sleep(0.2)  # 200ms debounce
-                            await self._hass.async_add_executor_job(self.set_brightness, brightness_value)
-                            # Update UI after debounced command
-                            self.async_write_ha_state()
-                        except asyncio.CancelledError:
-                            pass
-                    
-                    self._brightness_task = asyncio.create_task(set_brightness_debounced())
-                else:
-                    # Apply immediately (click or combined with other params)
-                    await self._hass.async_add_executor_job(self.set_brightness, brightness_value)
-                    self.async_write_ha_state()
-
-            # Update state to reflect desired state if already on
-            if not was_off:
-                self._state.is_on = True
-                self.async_write_ha_state()
-
-    async def async_turn_off(self, **kwargs):
-        """Turn off the light (async)."""
-        if self._hass is None:
-            return
-        
-        async with self._command_lock:
-            # Sync current state from device
-            await self._sync_state()
-
-            # Turn off if it's on - use toggle with desired state
-            if self._state.is_on:
-                await self._hass.async_add_executor_job(self._toggle_sync, False)
-                self.async_write_ha_state()
+        # Apply remaining parameters
+        for k, v in kwargs.items():
+            if k == ATTR_BRIGHTNESS:
+                self.set_brightness(v)
+            elif k == "rgb_color":
+                self.set_color(*v)
+            elif k == ATTR_HS_COLOR:
+                r, g, b = color_util.color_hs_to_RGB(*v)
+                self.set_color(r, g, b)
+            elif k == ATTR_WHITE:
+                self.set_white(v)
+            elif k == ATTR_EFFECT or k == "speed":
+                # Already handled above
+                continue
             else:
-                # Already off
-                self._state.is_on = False
-                self.async_write_ha_state()
+                _LOGGER.debug("Unknown control key: %s", k)
+
+        # If we believe it's off, toggle it on
+        if not self._state.is_on:
+            self.toggle()
+
+    def turn_off(self, **kwargs):
+        """Turn off the light synchronously."""
+        if self._state.is_on:
+            self.toggle()
+
+    # Segment helpers ------------------------------------------------------
 
     def set_segments(self, segments):
         self.send_command(Command.SET_SEGMENT_COUNT, [segments])
@@ -378,27 +233,6 @@ class WifiLedShopLight(LightEntity):
         response = self.send_command(Command.SYNC, [])
         if response:
             self._state.update_from_sync(bytearray(response))
-
-    async def async_update(self):
-        """Update state from device (async for Home Assistant)."""
-        if self._hass is None:
-            return
-        async with self._update_lock:
-            try:
-                response = await self._hass.async_add_executor_job(
-                    self.send_command, Command.SYNC, []
-                )
-                if response:
-                    # Update state from device
-                    self._state.update_from_sync(bytearray(response))
-            except Exception as e:
-                _LOGGER.warning("Failed to update state: %s", e)
-
-    async def async_added_to_hass(self):
-        """Called when entity is added to Home Assistant."""
-        self._hass = self.hass
-        # Do initial update
-        await self.async_update()
 
     def __repr__(self):
         return f"""WifiLedShopLight @ {self._ip}:{self._port}
